@@ -1,0 +1,6 @@
+---
+extensions:
+  - args:
+      ext_dir: eda/plugins/event_filter
+  - args:
+      ext_dir: eda/plugins/event_source

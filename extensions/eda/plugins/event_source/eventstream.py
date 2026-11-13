@@ -1,0 +1,760 @@
+# Copyright (c) 2024, CrowdStrike Inc.
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+"""CrowdStrike Falcon Event Stream API event source plugin."""
+
+import asyncio
+import json
+import logging
+import re
+import time
+from collections.abc import AsyncGenerator, Callable
+from typing import Any
+
+import aiohttp
+
+DOCUMENTATION = r"""
+---
+name: eventstream
+short_description: Event source plugin for CrowdStrike Falcon Event Stream API
+description:
+    - This event source plugin connects to the CrowdStrike Falcon Event Stream API and forwards events to EDA
+options:
+    falcon_client_id:
+        description: Client ID for CrowdStrike Falcon API authentication
+        required: true
+        type: str
+    falcon_client_secret:
+        description: Client secret for CrowdStrike Falcon API authentication
+        required: true
+        type: str
+    falcon_cloud:
+        description: CrowdStrike Falcon cloud region
+        default: 'us-1'
+        type: str
+    stream_name:
+        description: Label identifying the connection
+        default: 'eda'
+        type: str
+    offset:
+        description: The offset to start streaming from
+        required: false
+        type: int
+    latest:
+        description: Start stream at the latest event
+        default: false
+        type: bool
+    delay:
+        description: Delay between events in seconds
+        default: 0
+        type: float
+    include_event_types:
+        description: List of event types to include
+        default: []
+        type: list
+        elements: str
+    exclude_event_types:
+        description: List of event types to exclude
+        default: []
+        type: list
+        elements: str
+"""
+
+EXAMPLES = r"""
+---
+- name: Listen for CrowdStrike Falcon detection events
+  hosts: localhost
+  sources:
+    - crowdstrike.falcon.eventstream:
+        falcon_client_id: "{{ falcon_client_id }}"
+        falcon_client_secret: "{{ falcon_client_secret }}"
+        falcon_cloud: us-1
+        stream_name: eda
+        latest: true
+        include_event_types:
+          - EppDetectionSummaryEvent
+"""
+
+RETURN = r"""
+---
+falcon:
+    description: Event data from CrowdStrike Falcon API
+    type: dict
+    returned: always
+    contains:
+        metadata:
+            description: Metadata about the event
+            type: dict
+        event:
+            description: The event data
+            type: dict
+"""
+
+logger = logging.getLogger()
+
+# Region Mapping
+REGIONS: dict[str, str] = {
+    "us-1": "https://api.crowdstrike.com",
+    "us-2": "https://api.us-2.crowdstrike.com",
+    "us-3": "https://api.us-3.crowdstrike.com",
+    "eu-1": "https://api.eu-1.crowdstrike.com",
+    "us-gov-1": "https://api.laggar.gcw.crowdstrike.com",
+    "us-gov-2": "https://api.us-gov-2.crowdstrike.mil",
+}
+
+# Keep this in sync with galaxy.yml
+VERSION = "4.2.1"
+
+# Maximum seconds to wait for stream data before checking token expiry.
+# Ensures timely token refresh even when no events or heartbeats arrive.
+_STREAM_POLL_INTERVAL = 30
+
+
+class AIOFalconAPI:
+    """An asynchronous API client for the CrowdStrike Falcon Event Stream API.
+
+    This client uses the aiohttp library to make asynchronous HTTP requests to
+    the Falcon API. It includes methods for authenticating to the API, listing
+    available streams, and refreshing a stream.
+
+    Attributes
+    ----------
+        BASE_URL (str): The base URL for the Falcon API.
+        TOKEN_URL (str): The endpoint for obtaining an access token.
+        LIST_STREAMS_URL (str): The endpoint for listing available streams.
+        REFRESH_STREAM_URL (str): The endpoint for refreshing a stream.
+        client_id (str): The client ID for authenticating to the Falcon API.
+        client_secret (str): The client secret for authenticating to the Falcon API.
+        base_url (str, optional): The base URL for the Falcon API. Defaults to BASE_URL.
+        session (aiohttp.ClientSession): The aiohttp client session for making HTTP requests.
+
+    Methods
+    -------
+        close: Close the aiohttp client session.
+        authenticate: Authenticate to the Falcon API and return the access token.
+        list_available_streams: List available streams from the Falcon API.
+        refresh_stream: Refresh a stream from the Falcon API.
+
+    """
+
+    BASE_URL = "https://api.crowdstrike.com"
+    TOKEN_URL = "/oauth2/token"  # noqa: S105
+    LIST_STREAMS_URL = "/sensors/entities/datafeed/v2"
+    REFRESH_STREAM_URL = "/sensors/entities/datafeed-actions/v1/{partition}"
+
+    def __init__(
+        self: "AIOFalconAPI",
+        client_id: str,
+        client_secret: str,
+        base_url: str | None = None,
+    ) -> None:
+        """Initialize a new AIOFalconAPI object.
+
+        Parameters
+        ----------
+        client_id: str
+            The client ID for authenticating to the Falcon API.
+        client_secret: str
+            The client secret for authenticating to the Falcon API.
+        base_url: str, optional
+            The base URL for the Falcon API. Defaults to BASE_URL.
+
+        """
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.base_url = base_url or self.BASE_URL
+        self.session = aiohttp.ClientSession(
+            headers={
+                "User-Agent": f"crowdstrike-ansible/eda/{VERSION}",
+            },
+        )
+
+    async def close(self: "AIOFalconAPI") -> None:
+        """Close the aiohttp session."""
+        await self.session.close()
+
+    async def authenticate(self: "AIOFalconAPI") -> str:
+        """Authenticate to the CrowdStrike Falcon API and return the access token.
+
+        This method sends a POST request to the Falcon API's authentication endpoint,
+        passing the client ID and secret in the request body. If authentication is
+        successful, it returns the access token provided by the API.
+
+        Returns
+        -------
+        str
+            The access token provided by the Falcon API.
+
+        Raises
+        ------
+        ValueError
+            If the credentials passed fail to authenticate.
+
+        """
+        url = self.base_url + self.TOKEN_URL
+        data = {"client_id": self.client_id, "client_secret": self.client_secret}
+        async with self.session.post(url, data=data) as resp:
+            result = await resp.json()
+            if not result.get("access_token"):
+                msg = (
+                    "Failed to authenticate to CrowdStrike Falcon API. "
+                    "Check credentials/falcon_cloud and try again."
+                )
+                raise ValueError(msg)
+            return result["access_token"]
+
+    async def list_available_streams(
+        self: "AIOFalconAPI",
+        token: str,
+        app_id: str,
+    ) -> dict:
+        """List available streams from Event Stream API.
+
+        This method sends a GET request to the Falcon API's endpoint for listing
+        available streams, passing the app_id as a parameter in the request.
+
+        Parameters
+        ----------
+        token: str
+            The access token for the Falcon API.
+        app_id: str
+            The ID of the app for which to list available streams.
+
+        Returns
+        -------
+        dict
+            The JSON response from the Falcon API, which includes details about
+            the available streams.
+
+        """
+        params = {"appId": app_id}
+        url = self.base_url + self.LIST_STREAMS_URL
+        headers = {"Authorization": "Bearer " + token}
+        async with self.session.get(url, headers=headers, params=params) as resp:
+            return await resp.json()
+
+    async def refresh_stream(
+        self: "AIOFalconAPI",
+        token: str,
+        partition: str,
+        app_id: str,
+    ) -> bool:
+        """Refresh a stream from Event Stream API.
+
+        This method sends a POST request to the Falcon API's endpoint for refreshing
+        a stream, passing the action_name and app_id as parameters in the request.
+
+        Parameters
+        ----------
+        token: str
+            The access token for the Falcon API.
+        partition: str
+            The partition ID of the stream to refresh.
+        app_id: str
+            The ID of the app for which to refresh the stream.
+
+        Returns
+        -------
+        bool
+            True if the refresh was successful (i.e., the server responded with
+            a status code of 200); False
+
+        """
+        ok_response = 200
+        params = {
+            "action_name": "refresh_active_stream_session",
+            "appId": app_id,
+        }
+        url = self.base_url + self.REFRESH_STREAM_URL.format(partition=partition)
+        headers = {
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+        }
+        async with self.session.post(url, headers=headers, params=params) as resp:
+            if resp.status != ok_response:
+                logger.warning(
+                    "Failed to refresh stream session (HTTP %s)",
+                    resp.status,
+                )
+            return resp.status == ok_response
+
+
+class Stream:
+    """Stream class for the CrowdStrike Falcon Event Stream API."""
+
+    def __init__(  # pylint: disable=too-many-positional-arguments
+        self: "Stream",
+        client: AIOFalconAPI,
+        stream_name: str,
+        offset: int | None,
+        *,
+        latest: bool,
+        include_event_types: list[str],
+        stream: dict,
+    ) -> None:
+        """Initialize a new Stream object.
+
+        Parameters
+        ----------
+        client: AIOFalconAPI
+            An instance of the Falcon APIHarness client.
+        stream_name: str
+            A label identifying the connection.
+        offset: int
+            The offset to start streaming from.
+        latest: bool
+            Start stream at the latest event.
+        include_event_types: List[str]
+            A list of event types to filter on.
+        stream: dict
+            A dictionary containing the details of the stream.
+
+        """
+        logger.info("Initializing Stream: %s", stream_name)
+        self.client: AIOFalconAPI = client
+        self.session: aiohttp.ClientSession = client.session
+        self.stream_name: str = stream_name
+        self.data_feed: str = stream["dataFeedURL"]
+        self.token: str = stream["sessionToken"]["token"]
+        self.refresh_url: str = stream["refreshActiveSessionURL"]
+        self.partition: str = re.findall(r"v1/(\d+)", self.refresh_url)[0]
+        self.offset: int = offset or 0
+        self.latest: bool = latest
+        self.include_event_types: list[str] = include_event_types
+        self.epoch: int = int(time.time())
+        self.refresh_interval: int = int(stream["refreshActiveSessionInterval"])
+        self.token_expired: Callable[[], bool] = lambda: (
+            (self.refresh_interval) - 60
+        ) + self.epoch < int(time.time())
+        self.spigot: aiohttp.ClientResponse | None = None
+
+    async def refresh(self: "Stream") -> bool:
+        """Refresh the stream and client token.
+
+        This method authenticates the client, and if authentication is successful,
+        it refreshes the active stream session.
+
+        Returns
+        -------
+        bool
+            True if the refresh was successful (i.e., the server responded with a
+            status code of 200); False otherwise.
+
+        """
+        refreshed: bool = False
+
+        token = await self.client.authenticate()
+        refreshed_partition: bool = await self.client.refresh_stream(
+            token,
+            self.partition,
+            self.stream_name,
+        )
+
+        if refreshed_partition:
+            self.epoch = int(time.time())
+            logger.info(
+                "Successfully refreshed stream %s:%s",
+                self.stream_name,
+                self.partition,
+            )
+            refreshed = True
+
+        return refreshed
+
+    async def reconnect(self: "Stream") -> None:
+        """Re-establish an expired stream session.
+
+        Re-authenticates, fetches a fresh stream listing, updates
+        session token / data-feed URL / refresh URL, and reopens the
+        connection.  Called when a periodic refresh returns HTTP 404,
+        indicating the server has expired the session.
+
+        Raises
+        ------
+        ValueError
+            If the expected partition is not found in the stream resources.
+
+        """
+        token = await self.client.authenticate()
+        streams = await self.client.list_available_streams(
+            token, self.stream_name,
+        )
+
+        resources = streams.get("resources", [])
+        partition_idx = int(self.partition)
+        if partition_idx >= len(resources):
+            msg = (
+                f"Partition {self.partition} not found in stream "
+                f"resources (got {len(resources)} partitions)"
+            )
+            raise ValueError(msg)
+
+        stream = resources[partition_idx]
+        self.data_feed = stream["dataFeedURL"]
+        self.token = stream["sessionToken"]["token"]
+        self.refresh_url = stream["refreshActiveSessionURL"]
+        self.epoch = int(time.time())
+        self.refresh_interval = int(stream["refreshActiveSessionInterval"])
+
+        await self.open_stream()
+
+    async def open_stream(self: "Stream") -> aiohttp.ClientResponse:
+        """Open a long-lived async HTTP connection to the CrowdStrike Falcon Event Stream.
+
+        Constructs the URL for the event stream using the data feed URL, offset, and
+        event type filter. This URL is used to send a GET request to the server. The
+        aiohttp.ClientSession is not managed within this function, so the caller must
+        ensure that the session is properly closed after usage.
+
+        Returns
+        -------
+        aiohttp.ClientResponse
+            The server's response to the GET request, which is an open streaming
+            connection.
+
+        """
+        event_type_filter = (
+            ""
+            if not self.include_event_types
+            else f"&eventType={','.join(self.include_event_types)}"
+        )
+        offset_filter = "&whence=2" if self.latest else f"&offset={self.offset}"
+
+        kwargs = {
+            "url": f"{self.data_feed}{offset_filter}{event_type_filter}",
+            "headers": {
+                "Authorization": f"Token {self.token}",
+            },
+            "raise_for_status": True,
+            "timeout": aiohttp.ClientTimeout(total=None),
+        }
+
+        self.spigot: aiohttp.ClientResponse = await self.session.get(**kwargs)
+        logger.info(
+            "Successfully opened stream %s:%s",
+            self.stream_name,
+            self.partition,
+        )
+        logger.debug("Stream URL: %s", kwargs["url"])
+        return self.spigot
+
+    async def stream_events(
+        self: "Stream",
+        exclude_event_types: list[str],
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Asynchronously generate events from the CrowdStrike Falcon Event Stream API.
+
+        This method opens a stream to the Falcon API, iterates over the lines in the
+        stream, and decodes and yields each event. It automatically refreshes the client
+        token and reopens the stream if the token has expired.
+
+        Parameters
+        ----------
+        exclude_event_types: list[str]
+            A list of event types to be excluded from the stream.
+
+        Yields
+        ------
+        dict[str, Any]
+            A dictionary containing the event data from the Falcon API and a
+            count of event types seen so far.
+
+        """
+        # Open the stream
+        await self.open_stream()
+        # Poll for data with a timeout so token refresh is never starved
+        while True:
+            try:
+                line = await asyncio.wait_for(
+                    self.spigot.content.readline(),
+                    timeout=_STREAM_POLL_INTERVAL,
+                )
+            except TimeoutError:
+                # No data arrived — check if a token refresh is needed
+                if self.token_expired():
+                    refresh = await self.refresh()
+                    if not refresh:
+                        logger.warning(
+                            "Stream session expired, reconnecting...",
+                        )
+                        await self.reconnect()
+                continue
+
+            # EOF — server closed the connection
+            if not line:
+                break
+
+            decoded_line = line.decode().rstrip()
+            if decoded_line:
+                json_event = json.loads(decoded_line)
+                event_type = json_event["metadata"]["eventType"]
+                self.offset = json_event["metadata"]["offset"]
+                if self.is_valid_event(event_type, exclude_event_types):
+                    yield {"falcon": json_event}
+
+            # Check after every received line as well
+            if self.token_expired():
+                refresh = await self.refresh()
+                if not refresh:
+                    logger.warning(
+                        "Stream session expired, reconnecting...",
+                    )
+                    await self.reconnect()
+
+    def is_valid_event(
+        self: "Stream",
+        event_type: str,
+        exclude_event_types: list[str],
+    ) -> bool:
+        """Check if a given event type is valid or not.
+
+        Parameters
+        ----------
+        event_type: str
+            The type of the event to be checked.
+        exclude_event_types: list[str]
+            A list of event types to be excluded.
+
+        Returns
+        -------
+        bool
+            Returns True if the event_type is not in the exclude_event_types list,
+            otherwise returns False.
+
+        """
+        return event_type not in exclude_event_types
+
+
+async def _validate_and_setup_client(
+    args: dict[str, Any],
+) -> tuple[AIOFalconAPI, str, int | None, bool, float, list[str], list[str]]:
+    """Validate arguments and setup falcon client.
+
+    Parameters
+    ----------
+    args : dict[str, Any]
+        The event_source arguments
+
+    Returns
+    -------
+    tuple
+        (falcon_client, stream_name, offset, latest, delay, include_event_types, exclude_event_types)
+
+    Raises
+    ------
+    ValueError
+        If a argument is invalid
+
+    """
+    falcon_client_id: str = str(args.get("falcon_client_id"))
+    falcon_client_secret: str = str(args.get("falcon_client_secret"))
+    falcon_cloud: str = str(args.get("falcon_cloud", "us-1"))
+    stream_name: str = str(args.get("stream_name", "eda")).lower()
+    offset: int | None = args.get("offset")
+    latest: bool = bool(args.get("latest", False))
+    delay: float = float(args.get("delay", 0))
+    include_event_types: list[str] = list(args.get("include_event_types", []))
+    exclude_event_types: list[str] = list(args.get("exclude_event_types", []))
+
+    if falcon_cloud not in REGIONS:
+        msg = f"Invalid falcon_cloud: {falcon_cloud}, must be one of {list(REGIONS.keys())}"
+        raise ValueError(msg)
+
+    # Offset and latest are mutually exclusive
+    if offset and latest:
+        msg = "'offset' and 'latest' are mutually exclusive parameters."
+        raise ValueError(msg)
+
+    falcon = AIOFalconAPI(
+        client_id=falcon_client_id,
+        client_secret=falcon_client_secret,
+        base_url=REGIONS[falcon_cloud],
+    )
+
+    return (
+        falcon,
+        stream_name,
+        offset,
+        latest,
+        delay,
+        include_event_types,
+        exclude_event_types,
+    )
+
+
+async def _create_streams(
+    falcon: AIOFalconAPI,
+    stream_name: str,
+    offset: int | None,
+    *,
+    latest: bool,
+    include_event_types: list[str],
+) -> list[Stream] | None:
+    """Create stream objects from available streams.
+
+    Parameters
+    ----------
+    falcon : AIOFalconAPI
+        The falcon API client
+    stream_name : str
+        Name of the stream
+    offset : int | None
+        Stream offset
+    latest : bool
+        Whether to use latest events
+    include_event_types : list[str]
+        Event types to include
+
+    Returns
+    -------
+    list[Stream] | None
+        List of stream objects, or None if no streams available
+
+    """
+    token = await falcon.authenticate()
+    available_streams = await falcon.list_available_streams(token, stream_name)
+
+    if "resources" not in available_streams:
+        errors = available_streams.get("errors", [])
+        error_details = "; ".join(
+            e.get("message", str(e)) for e in errors
+        ) if errors else "unknown error"
+        logger.error(
+            "Failed to list streams from CrowdStrike API: %s. "
+            "Check your falcon_cloud region and credentials.",
+            error_details,
+        )
+        return None
+
+    if not available_streams["resources"]:
+        logger.info(
+            "Unable to open stream, no streams available. "
+            "Ensure you are using a unique stream_name.",
+        )
+        return None
+
+    streams: list[Stream] = [
+        Stream(
+            falcon,
+            stream_name,
+            offset=offset,
+            latest=latest,
+            include_event_types=include_event_types,
+            stream=stream,
+        )
+        for stream in available_streams["resources"]
+    ]
+    return streams
+
+
+async def _process_events(
+    streams: list[Stream],
+    queue: asyncio.Queue,
+    delay: float,
+    exclude_event_types: list[str],
+) -> None:
+    """Process events from streams.
+
+    Parameters
+    ----------
+    streams : list[Stream]
+        List of stream objects to process
+    queue : asyncio.Queue
+        The queue to send events to
+    delay : float
+        Delay between events
+    exclude_event_types : list[str]
+        Event types to exclude
+
+    """
+    try:
+        # Iterate over each stream in the streams list
+        for stream in streams:
+            async for event in stream.stream_events(exclude_event_types):
+                await queue.put(event)
+                await asyncio.sleep(delay)
+    except TimeoutError:
+        logger.exception("Timeout occurred while streaming events.")
+    except aiohttp.ClientError:
+        logger.exception("Client error occurred while streaming events.")
+    except Exception:  # pylint: disable=broad-except
+        logger.exception("Uncaught Plugin Task Error.")
+    else:
+        logger.info("All streams processed successfully.")
+
+
+async def _cleanup_streams(streams: list[Stream], falcon: AIOFalconAPI) -> None:
+    """Clean up streams and falcon client.
+
+    Parameters
+    ----------
+    streams : list[Stream]
+        List of stream objects to clean up
+    falcon : AIOFalconAPI
+        Falcon API client to close
+
+    """
+    logger.info("Plugin Task Finished..cleaning up")
+    # Close the stream and API session outside the loop
+    for stream in streams:
+        if stream.spigot:
+            stream.spigot.close()
+    await falcon.close()
+
+
+# pylint: disable=too-many-locals
+async def main(queue: asyncio.Queue, args: dict[str, Any]) -> None:
+    """Entrypoint for the eventstream event_source plugin.
+
+    Parameters
+    ----------
+    queue: asyncio.Queue
+        The queue to send events to
+    args: dict[str, Any]
+        The event_source arguments
+
+    """
+    (
+        falcon,
+        stream_name,
+        offset,
+        latest,
+        delay,
+        include_event_types,
+        exclude_event_types,
+    ) = await _validate_and_setup_client(args)
+
+    streams = await _create_streams(
+        falcon,
+        stream_name,
+        offset,
+        latest=latest,
+        include_event_types=include_event_types,
+    )
+    if streams is None:
+        await falcon.close()
+        return
+
+    try:
+        await _process_events(streams, queue, delay, exclude_event_types)
+    finally:
+        await _cleanup_streams(streams, falcon)
+
+
+if __name__ == "__main__":
+
+    class MockQueue:
+        """Mock Queue for testing purposes."""
+
+        async def put(self: "MockQueue", event: dict) -> None:
+            """Print the event.
+
+            Parameters
+            ----------
+            event: dict
+                The event to be printed.
+
+            """
+            print(event)  # noqa: T201
+
+    mock_arguments = {}
+    asyncio.run(main(MockQueue(), mock_arguments))

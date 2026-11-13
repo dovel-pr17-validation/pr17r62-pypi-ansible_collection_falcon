@@ -1,0 +1,53 @@
+---
+# tasks file for falcon_configure
+- name: API block
+  when:
+    - falcon_client_id | default('', true) | length > 0
+    - falcon_client_secret | default('', true) | length > 0
+    - falcon_option_set
+    - not falcon_cid | default('', true) | length > 0
+  block:
+    - ansible.builtin.include_role:
+        name: falcon_install
+        tasks_from: validate_api_credentials
+      # noqa name[missing]
+
+    - ansible.builtin.include_role:
+        name: falcon_install
+        tasks_from: auth
+      # noqa name[missing]
+
+- name: Checks if any options are set
+  ansible.builtin.set_fact:
+    any_option_set: "{{ true if (options | dict2items | selectattr('value', 'ne', omit) | list | length > 0) else false }}"
+
+- name: Linux Configure block
+  when:
+    - ansible_facts['os_family'] != "Windows"
+    - any_option_set
+  become: true
+  become_user: root
+  block:
+    - ansible.builtin.include_tasks: configure.yml
+      # noqa name[missing]
+
+- name: Remove AID block
+  when:
+    - falcon_remove_aid is defined and falcon_remove_aid | bool
+    - not any_option_set
+    - ansible_facts['os_family'] != "Windows"
+  become: true
+  become_user: root
+  block:
+    - ansible.builtin.include_tasks: remove_aid.yml
+      # noqa name[missing]
+
+- name: Windows block
+  when:
+    - ansible_facts['os_family'] == "Windows"
+  become: "{{ falcon_windows_become }}"
+  become_method: "{{ falcon_windows_become_method }}"
+  become_user: "{{ falcon_windows_become_user }}"
+  block:
+    - ansible.builtin.include_tasks: win_configure.yml
+      # noqa name[missing]

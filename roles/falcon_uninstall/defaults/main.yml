@@ -1,0 +1,66 @@
+---
+# defaults for falcon_uninstall
+
+# Whether to enable or disable the logging of sensitive data being exposed in API calls.
+# By default, this is enabled.
+#
+# Disabling this can expose your API credentials and authorization token.
+#
+falcon_api_enable_no_log: true
+
+# CrowdStrike API cloud region. All regions are automatically discovered,
+# except for us-gov-1. Possible values:
+#       us-1
+#       us-2
+#       us-3
+#       eu-1
+#       us-gov-1
+#       us-gov-2
+#
+falcon_cloud: "us-1"
+
+# 'Client ID' and 'Client Secret' for authentication against the CrowdStrike
+# API. If unknown, get it from the CrowdStrike support portal:
+#
+#   https://falcon.crowdstrike.com/support/api-clients-and-keys
+#
+falcon_client_id:
+falcon_client_secret:
+# Whether to hide/remove the host from the CrowdStrike console.
+# The default is false
+#
+falcon_remove_host: false
+
+# Maintenance token for sensor operations when uninstall and maintenance protection is enabled.
+# Required for sensor versions 7.20+ when protection is armed.
+#
+# Examples:
+#   # Manual token
+#   falcon_maintenance_token: "your-token-here"
+#
+#   # Bulk token (recommended)
+#   falcon_maintenance_token: "{{ lookup('crowdstrike.falcon.maintenance_token', bulk=true) }}"
+#
+#   # Host-specific token
+#   falcon_maintenance_token: "{{ lookup('crowdstrike.falcon.maintenance_token', host_aid) }}"
+#
+falcon_maintenance_token:
+# Additional arugments to uninstall the sensor.
+# You can add your maintenance token here by adding MAINTENANCE_TOKEN=<token>
+#
+falcon_windows_uninstall_args: "/norestart"
+
+# Ansible become toggle for Windows systems.
+# The default is true
+#
+falcon_windows_become: true
+
+# Ansible become method for Windows systems.
+# The default is runas
+#
+falcon_windows_become_method: runas
+
+# Ansible become user for Windows systems.
+# The default is SYSTEM
+#
+falcon_windows_become_user: SYSTEM

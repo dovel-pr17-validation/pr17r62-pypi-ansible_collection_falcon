@@ -1,0 +1,15 @@
+---
+exclude_paths:
+  - ".[dgc]*"
+  - ".ansible/collections/" # Exclude duplicate processing of installed collections
+  - "tests/container-env/" # Exclude container test environment files
+
+enable_list:
+  - fqcn-builtins # opt-in
+
+skip_list:
+  - "var-naming[no-role-prefix]"
+  - "run-once[task]"
+
+warn_list:
+  - experimental

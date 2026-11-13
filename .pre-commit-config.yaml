@@ -1,0 +1,33 @@
+---
+# Fast pre-commit checks to catch common issues quickly (< 30 seconds)
+# For deep testing, manually run: ansible-test sanity --exclude '.devcontainer/' -v --docker && tox
+repos:
+  # Basic file hygiene - catches obvious issues
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: [--maxkb=1024] # 1MB limit
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-ast # Python syntax check
+        files: \.py$
+
+  # YAML linting - fast syntax and style checking
+  - repo: https://github.com/adrienverge/yamllint.git
+    rev: v1.35.1
+    hooks:
+      - id: yamllint
+        args: [-c=.yamllint]
+        exclude: ^\.github/
+
+  # Ansible linting - catches Ansible-specific issues quickly
+  - repo: https://github.com/ansible/ansible-lint.git
+    rev: v25.8.2 # Match CI workflow version
+    hooks:
+      - id: ansible-lint
+        # Only run on changed YAML files for speed
+        files: \.(yaml|yml|py)$
